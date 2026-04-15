@@ -1,94 +1,109 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import pandas_ta as ta
 import feedparser
 import plotly.graph_objects as go
 
-# Uygulama Ayarları (Mobil uyumlu geniş görünüm)
+# Uygulama Ayarları
 st.set_page_config(page_title="Silver Quant Terminal", layout="wide")
-st.title("🪙 Gümüş (XAG/USD) Quant Analiz Terminali")
-st.markdown("Matematiksel teknik analiz ve global haber akışı ile karar destek sistemi.")
+st.title("🪙 Gümüş (XAG/TRY) Analiz Terminali")
 
-# 1. VERİ ÇEKME (Gümüş Vadelileri: SI=F)
-@st.cache_data(ttl=900) # Veriyi 15 dakikada bir günceller
-def get_silver_data():
-    silver = yf.Ticker("SI=F")
-    df = silver.history(period="6mo") # Son 6 aylık veri
+# 1. VERİ ÇEKME VE HESAPLAMA (Gümüş Ons + Dolar Kuru)
+@st.cache_data(ttl=300) # 5 dakikada bir verileri tazeler
+def get_market_data():
+    # SI=F (Gümüş Ons), USDTRY=X (Dolar/TL)
+    data = yf.download(["SI=F", "USDTRY=X"], period="6mo", interval="1d")
     
-    # Teknik İndikatörleri Hesapla (Wall Street Standartları)
-    df.ta.rsi(length=14, append=True) # Göreceli Güç Endeksi
-    df.ta.macd(fast=12, slow=26, signal=9, append=True) # MACD
-    df.ta.bbands(length=20, std=2, append=True) # Bollinger Bantları
+    # Çoklu indeksi temizle ve sadece Kapanış (Close) fiyatlarını al
+    df_silver = data['Close']['SI=F'].to_frame(name='Silver_Ons')
+    df_usdtry = data['Close']['USDTRY=X'].to_frame(name='USDTRY')
+    
+    # Verileri birleştir
+    df = pd.concat([df_silver, df_usdtry], axis=1).ffill()
+    
+    # GRAM TL HESABI: (Ons Fiyatı / 31.1035) * Dolar Kuru
+    df['Gram_TL'] = (df['Silver_Ons'] / 31.1035) * df['USDTRY']
+    
+    # TEKNİK ANALİZ (Gram TL Üzerinden)
+    # RSI
+    delta = df['Gram_TL'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+    
+    # MACD
+    exp1 = df['Gram_TL'].ewm(span=12, adjust=False).mean()
+    exp2 = df['Gram_TL'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = exp1 - exp2
+    df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    
+    # Bollinger Bantları
+    df['MA20'] = df['Gram_TL'].rolling(window=20).mean()
+    df['STD20'] = df['Gram_TL'].rolling(window=20).std()
+    df['BB_Upper'] = df['MA20'] + (df['STD20'] * 2)
+    df['BB_Lower'] = df['MA20'] - (df['STD20'] * 2)
     
     return df
 
-df = get_silver_data()
-current_price = df['Close'].iloc[-1]
-prev_price = df['Close'].iloc[-2]
-price_change = current_price - prev_price
+try:
+    df = get_market_data()
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
 
-st.metric(label="Güncel Gümüş Fiyatı (USD/ons)", 
-          value=f"${current_price:.2f}", 
-          delta=f"${price_change:.2f}")
+    # METRİKLER (Gram TL ve Ons USD)
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Gümüş Gram (TL)", f"{latest['Gram_TL']:.2f} ₺", f"{latest['Gram_TL'] - prev['Gram_TL']:.2f} ₺")
+    col2.metric("Gümüş Ons (USD)", f"${latest['Silver_Ons']:.2f}", f"${latest['Silver_Ons'] - prev['Silver_Ons']:.2f}")
+    col3.metric("USD/TRY Kuru", f"{latest['USDTRY']:.2f} ₺")
 
+    st.divider()
+
+    # 2. AL/SAT SİNYAL ÜRETİCİ (Hata düzeltildi)
+    st.subheader("📊 Algoritmik Sinyaller (Gram/TL Bazlı)")
+    
+    rsi = latest['RSI']
+    macd = latest['MACD']
+    macd_signal = latest['MACD_Signal']
+    price = latest['Gram_TL']
+    bb_lower = latest['BB_Lower']
+    bb_upper = latest['BB_Upper']
+
+    signal = "NÖTR 🟡"
+    reason = "Matematiksel göstergeler şu an dengede."
+
+    if rsi < 30 and price <= bb_lower:
+        signal = "GÜÇLÜ AL 🟢"
+        reason = "RSI aşırı satımda ve fiyat alt Bollinger bandında. Wall Street tekniklerine göre tepki alımı beklenir."
+    elif rsi > 70 and price >= bb_upper:
+        signal = "GÜÇLÜ SAT 🔴"
+        reason = "RSI aşırı alımda ve fiyat üst Bollinger bandında. Teknik olarak düzeltme kapıda."
+    elif macd > macd_signal:
+        signal = "AL 📈"
+        reason = "MACD sinyal çizgisini yukarı kesti. Pozitif momentum devam ediyor."
+    elif macd < macd_signal:
+        signal = "SAT 📉"
+        reason = "MACD sinyal çizgisini aşağı kesti. Negatif eğilim hakim."
+
+    st.info(f"**ÖNERİ:** {signal}\n\n**GEREKÇE:** {reason}")
+
+    # 3. GRAFİK
+    st.subheader("📈 Gümüş Gram/TL Teknik Grafik")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df.index, y=df['Gram_TL'], name='Gram TL Fiyatı'))
+    fig.add_trace(go.Scatter(x=df.index, y=df['BB_Upper'], name='Üst Bant', line=dict(dash='dash', color='rgba(200,200,200,0.5)')))
+    fig.add_trace(go.Scatter(x=df.index, y=df['BB_Lower'], name='Alt Bant', line=dict(dash='dash', color='rgba(200,200,200,0.5)')))
+    fig.update_layout(height=500, template="plotly_dark")
+    st.plotly_chart(fig, use_container_width=True)
+
+except Exception as e:
+    st.error(f"Veri çekilirken bir hata oluştu: {e}")
+
+# 4. GLOBAL HABERLER
 st.divider()
-
-# 2. MATEMATİKSEL AL/SAT SİNYALİ ÜRETİCİ
-st.subheader("📊 Algoritmik Sinyaller (Günlük Periyot)")
-
-# Son günün verilerini al
-latest = df.iloc[-1]
-rsi = latest['RSI_14']
-macd = latest['MACD_12_26_9']
-macd_signal = latest['MACDs_12_26_9']
-close_price = latest['Close']
-bb_lower = latest['BBL_20_2.0']
-bb_upper = latest['BBU_20_2.0']
-
-signal = "NÖTR 🟡"
-reason = "Piyasa şu an yatay seyrediyor, net bir aşırı alım veya satım yok."
-
-# Temel Quant Mantığı
-if rsi < 30 and close_price <= bb_lower:
-    signal = "GÜÇLÜ AL 🟢"
-    reason = f"RSI çok düşük ({rsi:.1f}) ve fiyat alt Bollinger bandına ({bb_lower:.2f}) dokundu. Matematiksel olarak aşırı satım var (Tepki yükselişi beklenir)."
-elif rsi > 70 and close_price >= bb_upper:
-    signal = "GÜÇLÜ SAT 🔴"
-    reason = f"RSI çok yüksek ({rsi:.1f}) ve fiyat üst Bollinger bandına ({bb_upper:.2f}) dokundu. Matematiksel olarak aşırı alım var (Düzeltme beklenir)."
-elif macd > macd_signal and rsi > 50:
-    signal = "AL 🟢 (Momentum)"
-    reason = "MACD sinyal çizgisini yukarı kesti ve momentum pozitif."
-elif macd < macd_signal and rsi < 50:
-    signal = "SAT 🔴 (Momentum)"
-    reason = "MACD sinyal çizgisini aşağı kesti ve momentum negatif."
-
-st.info(f"**SİNYAL:** {signal}\n\n**Gerekçe:** {reason}")
-
-# 3. PROFESYONEL GRAFİK ÇİZİMİ
-fig = go.Figure(data=[go.Candlestick(x=df.index,
-                open=df['Open'], high=df['High'],
-                low=df['Low'], close=df['Close'], name="Fiyat")])
-
-fig.update_layout(title="Gümüş Mum Grafiği (Son 6 Ay)", xaxis_title="Tarih", yaxis_title="Fiyat (USD)", height=400)
-st.plotly_chart(fig, use_container_width=True)
-
-st.divider()
-
-# 4. GLOBAL HABER TARAMA (RSS üzerinden otomatik çekim)
-st.subheader("🌍 Canlı Global Gümüş Haberleri")
-
-@st.cache_data(ttl=1800) # Haberleri 30 dakikada bir günceller
-def get_silver_news():
-    # Google News RSS (İngilizce global haberler için)
-    url = "https://news.google.com/rss/search?q=silver+market+or+silver+price&hl=en-US&gl=US&ceid=US:en"
-    feed = feedparser.parse(url)
-    return feed.entries[:5] # En güncel 5 haber
-
-news_entries = get_silver_news()
-
-for entry in news_entries:
-    with st.container():
-        st.markdown(f"**[{entry.title}]({entry.link})**")
-        st.caption(entry.published)
-  
+st.subheader("🌍 Canlı Global Haber Akışı")
+feed = feedparser.parse("https://news.google.com/rss/search?q=silver+market+news&hl=en-US&gl=US&ceid=US:en")
+for entry in feed.entries[:5]:
+    st.markdown(f"🔹 **[{entry.title}]({entry.link})**")
+    st.caption(f"Yayınlanma: {entry.published}")
+    
